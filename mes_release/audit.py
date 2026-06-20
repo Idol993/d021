@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .models import (
     AuditLog,
@@ -86,13 +86,20 @@ class AuditLogger:
             for i, log in enumerate(logs):
                 expected_hash = log.compute_hash()
                 if expected_hash != log.entry_hash:
-                    issues.append({
+                    tampered_fields = self._detect_tampered_fields(log)
+                    issue = {
                         "index": i,
                         "log_id": log.id,
                         "type": "hash_mismatch",
                         "expected": expected_hash,
                         "actual": log.entry_hash,
-                    })
+                        "tampered_fields": tampered_fields,
+                        "detail": (
+                            f"审计记录第{i+1}条（ID: {log.id[:8]}...）哈希校验失败。"
+                            + (f" 疑似篡改字段: {', '.join(tampered_fields)}" if tampered_fields else " 未知字段被篡改")
+                        ),
+                    }
+                    issues.append(issue)
                 if log.previous_hash != prev_hash:
                     issues.append({
                         "index": i,
@@ -100,6 +107,10 @@ class AuditLogger:
                         "type": "chain_break",
                         "expected_prev": prev_hash,
                         "actual_prev": log.previous_hash,
+                        "detail": (
+                            f"审计记录第{i+1}条（ID: {log.id[:8]}...）哈希链断裂。"
+                            f"前序哈希应为: {prev_hash[:16]}... 实际存储: {log.previous_hash[:16] if log.previous_hash else 'None'}... (可能记录被删除或顺序打乱)"
+                        ),
                     })
                 prev_hash = log.entry_hash
             return {
@@ -109,6 +120,27 @@ class AuditLogger:
             }
         finally:
             session.close()
+
+    def _detect_tampered_fields(self, log: AuditLog) -> List[str]:
+        hash_input_fields = [
+            ("actor", "操作人(actor)"),
+            ("action", "操作动作(action)"),
+            ("category", "分类(category)"),
+            ("release_id", "关联发布ID(release_id)"),
+            ("details", "详情内容(details)"),
+            ("ip_address", "来源IP地址(ip_address)"),
+            ("entity_type", "操作对象类型(entity_type)"),
+            ("entity_id", "操作对象ID(entity_id)"),
+        ]
+        suspicious = []
+        for field_name, field_cn in hash_input_fields:
+            val = getattr(log, field_name, None)
+            if field_name == "details" and isinstance(val, dict) and not val:
+                continue
+            if val is None and field_name in ("release_id", "ip_address", "entity_type", "entity_id"):
+                continue
+            suspicious.append(field_cn)
+        return suspicious
 
 
 audit_logger = AuditLogger()

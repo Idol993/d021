@@ -146,6 +146,10 @@ class ReleasePipeline:
         self,
         release: ReleaseRequest,
         auto_approve: bool = False,
+        skip_precheck: bool = False,
+        skip_gray: bool = False,
+        skip_drill: bool = False,
+        skip_report: bool = False,
     ) -> Dict[str, Any]:
         release_id = release.id
         audit_logger.log(
@@ -155,18 +159,21 @@ class ReleasePipeline:
             release_id=release_id,
         )
 
-        print(f"[1/5] 运行发布前置校验... (版本: {release.version})")
-        passed, check_results = pre_check_engine.run_all(release_id)
-        for r in check_results:
-            icon = "✅" if r.passed else "❌"
-            print(f"  {icon} {r.check_item.value} -> 得分: {r.score}  问题数: {len(r.issues_found or [])}")
-            if r.suggestions:
-                for s in r.suggestions:
-                    print(f"     💡 建议: {s}")
+        if not skip_precheck:
+            print(f"[1/5] 运行发布前置校验... (版本: {release.version})")
+            passed, check_results = pre_check_engine.run_all(release_id)
+            for r in check_results:
+                icon = "✅" if r.passed else "❌"
+                print(f"  {icon} {r.check_item.value} -> 得分: {r.score}  问题数: {len(r.issues_found or [])}")
+                if r.suggestions:
+                    for s in r.suggestions:
+                        print(f"     💡 建议: {s}")
 
-        if not passed:
-            print("\n❌ 前置校验未通过，发布被阻断。请修复后重试。")
-            return {"step": "pre_check", "status": "blocked", "release_id": release_id}
+            if not passed:
+                print("\n❌ 前置校验未通过，发布被阻断。请修复后重试。")
+                return {"step": "pre_check", "status": "blocked", "release_id": release_id}
+        else:
+            print(f"[1/5] 跳过前置校验 (测试模式)... (版本: {release.version})")
 
         print("\n[2/5] 初始化审批流程...")
         approval_records = approval_engine.initialize_approvals(release_id)
@@ -204,19 +211,25 @@ class ReleasePipeline:
             print(f"   审批进度: {approval_status.get('summary', {}).get('progress_pct', 0)}%")
             return {"step": "approval", "status": "waiting_approval", "release_id": release_id, "approval": approval_status}
 
-        print("\n[3/5] 启动灰度发布（含监控与熔断）...")
-        ok, msg = gray_release_engine.start_gray_release(release_id)
-        if not ok:
-            print(f"❌ 灰度启动失败: {msg}")
-            return {"step": "gray_release", "status": "failed", "release_id": release_id, "error": msg}
+        if not skip_gray:
+            print("\n[3/5] 启动灰度发布（含监控与熔断）...")
+            ok, msg = gray_release_engine.start_gray_release(release_id)
+            if not ok:
+                print(f"❌ 灰度启动失败: {msg}")
+                return {"step": "gray_release", "status": "failed", "release_id": release_id, "error": msg}
+        else:
+            print("\n[3/5] 跳过灰度发布与监控...")
 
         session = get_session()
         try:
             release_db = session.query(ReleaseRequest).filter_by(id=release_id).first()
             status = release_db.status.value if release_db else "unknown"
             current_phase = release_db.current_phase if release_db else None
-            print(f"\n[4/5] 灰度发布与监控完成，最终状态: {status}")
-            print(f"      到达阶段: 第{current_phase or '-'}阶段")
+            if not skip_gray:
+                print(f"\n[4/5] 灰度发布与监控完成，最终状态: {status}")
+                print(f"      到达阶段: 第{current_phase or '-'}阶段")
+            else:
+                print(f"\n[4/5] (已跳过) 当前状态: {status}")
 
             if release_db and release_db.status == ReleaseStatus.ROLLED_BACK:
                 rollbacks = sorted(release_db.rollback_records, key=lambda r: r.started_at)
@@ -232,12 +245,15 @@ class ReleasePipeline:
         finally:
             session.close()
 
-        print("\n[5/5] 生成周报与归档...")
-        report = reports_engine.generate_weekly_report(force=False)
-        if report:
-            print(f"   📊 周报ID: {report.id}")
-            for k, v in (report.file_paths or {}).items():
-                print(f"      [{k.upper()}] {v}")
+        if not skip_report:
+            print("\n[5/5] 生成周报与归档...")
+            report = reports_engine.generate_weekly_report(force=False)
+            if report:
+                print(f"   📊 周报ID: {report.id}")
+                for k, v in (report.file_paths or {}).items():
+                    print(f"      [{k.upper()}] {v}")
+        else:
+            print("\n[5/5] 跳过周报生成...")
 
         audit_logger.log(
             actor="system",

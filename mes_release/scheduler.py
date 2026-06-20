@@ -26,8 +26,11 @@ class ReleaseScheduler:
             return
         self._initialized = True
         self.timezone = config.get("system.timezone", "Asia/Shanghai")
+        self._blocking = False
+        self._shutdown_event = None
+        self._use_blocking = False
 
-    def start(self) -> Dict[str, Any]:
+    def start(self, blocking: bool = False) -> Dict[str, Any]:
         if self._scheduler and self._scheduler.running:
             return {
                 "running": True,
@@ -36,7 +39,13 @@ class ReleaseScheduler:
                 "message": "调度器已在运行中，未重复创建任务",
             }
 
-        self._scheduler = BackgroundScheduler(timezone=self.timezone)
+        self._use_blocking = blocking
+
+        if blocking:
+            from apscheduler.schedulers.blocking import BlockingScheduler
+            self._scheduler = BlockingScheduler(timezone=self.timezone)
+        else:
+            self._scheduler = BackgroundScheduler(timezone=self.timezone)
 
         weekly_cron = config.get("reports.weekly.schedule", "0 9 * * 1")
         drill_cron = config.get("rollback_drill.schedule", "0 14 28 * *")
@@ -72,6 +81,7 @@ class ReleaseScheduler:
                 "drill_cron": drill_cron,
                 "timezone": self.timezone,
                 "jobs": self._list_jobs_info(),
+                "blocking": blocking,
             },
         )
 
@@ -79,7 +89,7 @@ class ReleaseScheduler:
             "running": True,
             "already_running": False,
             "jobs": self._list_jobs_info(),
-            "message": "调度器已启动，2个定时任务已注册",
+            "message": f"调度器已启动，2个定时任务已注册{'（常驻运行中，按 Ctrl+C 停止）' if blocking else ''}",
         }
 
     def stop(self) -> Dict[str, Any]:
@@ -113,15 +123,29 @@ class ReleaseScheduler:
         }
 
     def trigger_now(self, job_id: str) -> Dict[str, Any]:
-        if not self._scheduler or not self._scheduler.running:
-            return {"success": False, "message": "调度器未在运行"}
-
-        job = self._scheduler.get_job(job_id)
-        if not job:
+        job_funcs = {
+            "weekly_report_job": self._weekly_report_job,
+            "rollback_drill_job": self._rollback_drill_job,
+        }
+        if job_id not in job_funcs:
             return {"success": False, "message": f"任务不存在: {job_id}"}
 
-        job.modify(next_run_time=get_utc_now())
-        return {"success": True, "message": f"任务已立即触发: {job.name}"}
+        print(f"[{get_utc_now().isoformat()}] ⚡ 手动触发任务: {job_id}")
+        try:
+            job_funcs[job_id]()
+            if self._scheduler and self._scheduler.running:
+                job = self._scheduler.get_job(job_id)
+                if job:
+                    try:
+                        job.modify(next_run_time=get_utc_now())
+                    except Exception:
+                        pass
+            return {"success": True, "message": f"任务已立即执行完成: {job_id}"}
+        except Exception as e:
+            import traceback
+            err_detail = traceback.format_exc()
+            print(f"  ❌ 任务执行失败: {e}\n{err_detail}")
+            return {"success": False, "message": f"任务执行失败: {str(e)}", "error_detail": err_detail}
 
     def _list_jobs_info(self) -> Dict[str, Any]:
         if not self._scheduler:

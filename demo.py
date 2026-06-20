@@ -113,13 +113,17 @@ def scenario_3_manual_rollback():
 
         target = releases[0]
         print(f"🎯 目标版本: {target.version} ({target.id[:8]}...)  状态: {target.status.value}")
-        ok, rb_id_or_msg = release_pipeline.manual_rollback(
+        rb_result = release_pipeline.manual_rollback(
             release_id=target.id,
             operator="赵生产主管",
             reason="人工巡检发现ORAL-03产线批记录签字字段渲染异常，可能影响合规，立即回滚。",
             production_lines=["ORAL-03"],
         )
-        print(f"   回滚结果: {'✅ 成功' if ok else '❌ 失败'} | ID={rb_id_or_msg}")
+        ok = rb_result.get("success", False)
+        rb_id = rb_result.get("result", "")
+        status_icon = "✅" if ok else "❌"
+        id_display = f" | 回滚记录ID={rb_id}" if ok else f" | 错误={rb_id}"
+        print(f"   回滚结果: {status_icon} {'成功' if ok else '失败'}{id_display}")
         return target
     finally:
         session.close()

@@ -491,6 +491,7 @@ class GrayReleaseEngine:
 
             session.commit()
             session.refresh(rollback)
+            rollback_id = rollback.id
             session.refresh(release)
 
             if self.rollback_cfg.get("notify_on_rollback", True):
@@ -501,7 +502,7 @@ class GrayReleaseEngine:
                 except Exception as notify_err:
                     print(f"  [警告] 回滚通知发送失败: {notify_err}")
 
-            return rollback
+            return rollback_id, rollback
         except Exception as e:
             print(f"  [严重错误] 回滚流程异常: {e}")
             import traceback
@@ -588,7 +589,7 @@ class GrayReleaseEngine:
                     lines.extend(phase.get("production_lines", []))
                 production_lines = lines
 
-            rb = self._trigger_rollback(
+            rb_id, rb = self._trigger_rollback(
                 release=release,
                 trigger_source=f"manual:{operator}",
                 reason=reason,
@@ -596,7 +597,7 @@ class GrayReleaseEngine:
                 triggered_by=operator,
                 force_rollback_type="manual",
             )
-            return True, rb.id
+            return True, rb_id
         finally:
             session.close()
 
