@@ -1,0 +1,224 @@
+system:
+  name: "药品生产MES系统版本发布与智能回滚自动化平台"
+  version: "1.0.0"
+  env: "production"
+  audit_log_enabled: true
+  timezone: "Asia/Shanghai"
+
+database:
+  type: "sqlite"
+  path: "./data/mes_release.db"
+  echo: false
+
+notification:
+  enabled: true
+  channels:
+    wework:
+      enabled: false
+      webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
+    dingtalk:
+      enabled: false
+      webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN"
+      secret: "YOUR_SECRET"
+    email:
+      enabled: false
+      smtp_host: "smtp.example.com"
+      smtp_port: 465
+      use_ssl: true
+      username: "notification@example.com"
+      password: "YOUR_PASSWORD"
+      sender: "MES发布平台 <notification@example.com>"
+      recipients:
+        - "dev@example.com"
+        - "qa@example.com"
+        - "production@example.com"
+
+pre_check:
+  gmp_compliance:
+    enabled: true
+    required_docs:
+      - "验证报告(V报告)"
+      - "变更控制记录"
+      - "风险评估报告"
+      - "回归测试报告"
+    check_documents_complete: true
+    check_change_control_closed: true
+  ebr_integrity:
+    enabled: true
+    template_consistency_check: true
+    required_fields_check: true
+    hash_verification: true
+    template_version: "v2.3.1"
+  device_connectivity:
+    enabled: true
+    plc_check: true
+    scada_check: true
+    handshake_timeout: 10
+    required_device_groups:
+      - "包装线PLC"
+      - "配料SCADA"
+      - "灭菌设备OPC"
+  performance_test:
+    enabled: true
+    core_interfaces:
+      - name: "批记录提交"
+        endpoint: "/api/ebr/submit"
+        max_response_time_ms: 500
+        min_throughput_tps: 100
+      - name: "设备指令下发"
+        endpoint: "/api/device/command"
+        max_response_time_ms: 200
+        min_throughput_tps: 500
+      - name: "物料扫码查询"
+        endpoint: "/api/material/scan"
+        max_response_time_ms: 300
+        min_throughput_tps: 300
+    stress_test_duration_min: 5
+    concurrent_users: 50
+
+approval:
+  channels:
+    regular:
+      name: "常规迭代"
+      approvers_chain:
+        - role: "生产经理"
+          department: "生产部"
+          sla_hours: 8
+          check_points: ["排产影响评估", "产能影响评估", "人员调度评估"]
+        - role: "QA主管"
+          department: "质量部"
+          sla_hours: 8
+          check_points: ["GMP合规性评估", "数据完整性评估", "批记录影响评估"]
+        - role: "工艺工程师"
+          department: "工程部"
+          sla_hours: 8
+          check_points: ["设备兼容性评估", "工艺参数评估", "配方变更评估"]
+        - role: "IT架构师"
+          department: "IT部"
+          sla_hours: 4
+          check_points: ["系统架构评估", "网络安全评估", "备份策略评估"]
+    hotfix:
+      name: "紧急热修复"
+      parallel_approval: true
+      post_sign_off_allowed: true
+      post_sign_off_deadline_hours: 24
+      approvers:
+        - role: "生产经理"
+          department: "生产部"
+          check_points: ["紧急排产调整"]
+        - role: "QA主管"
+          department: "质量部"
+          check_points: ["紧急偏差处理"]
+        - role: "IT主管"
+          department: "IT部"
+          check_points: ["紧急变更控制"]
+      require_emergency_reason: true
+      require_deviation_report: true
+
+gray_release:
+  phases:
+    - order: 1
+      name: "研发/非核心产线"
+      production_lines:
+        - "R&D-01"
+        - "R&D-02"
+        - "PKG-AUX"
+      weight: 10
+      duration_min: 30
+      auto_advance: true
+      advance_condition: "指标全部达标且运行时长达到"
+    - order: 2
+      name: "常规口服制剂线"
+      production_lines:
+        - "ORAL-01"
+        - "ORAL-02"
+        - "ORAL-03"
+        - "ORAL-04"
+      weight: 40
+      duration_min: 60
+      auto_advance: true
+    - order: 3
+      name: "无菌/高活产线"
+      production_lines:
+        - "STER-01"
+        - "STER-02"
+        - "HP-01"
+      weight: 50
+      duration_min: 120
+      auto_advance: true
+      require_manual_confirm: true
+  monitoring:
+    interval_min: 5
+    metrics:
+      production_anomaly_rate:
+        name: "生产异常率"
+        unit: "%"
+        threshold_yellow: 1.0
+        threshold_red: 3.0
+      ebr_error_rate:
+        name: "批记录错误率"
+        unit: "%"
+        threshold_yellow: 0.5
+        threshold_red: 2.0
+      device_comm_latency_ms:
+        name: "设备通讯延迟"
+        unit: "ms"
+        threshold_yellow: 500
+        threshold_red: 2000
+      interface_error_rate:
+        name: "接口错误率"
+        unit: "%"
+        threshold_yellow: 0.5
+        threshold_red: 2.0
+    circuit_breaker:
+      enabled: true
+      consecutive_failures: 2
+      cool_down_min: 5
+  rollback:
+    auto_rollback_enabled: true
+    rollback_strategy: "version_snapshot"
+    health_check_after_rollback: true
+    notify_on_rollback: true
+
+audit:
+  immutable_log: true
+  log_retention_days: 3650
+  hash_algorithm: "SHA256"
+  export_formats: ["xlsx", "csv", "pdf"]
+
+reports:
+  weekly:
+    enabled: true
+    schedule: "0 9 * * 1"
+    include_trend_charts: true
+    metrics:
+      - "发布成功率"
+      - "回滚次数"
+      - "平均审批时长"
+      - "平均灰度时长"
+      - "熔断触发次数"
+    formats: ["pdf", "xlsx"]
+    output_dir: "./reports/weekly"
+
+rollback_drill:
+  enabled: true
+  schedule: "0 14 28 * *"
+  notify_before_hours: 72
+  require_participant_confirmation: true
+  participants:
+    - role: "IT运维"
+    - role: "生产主管"
+    - role: "QA现场"
+  success_criteria:
+    max_rollback_duration_min: 30
+    data_consistency_check: true
+    service_availability_after: 100
+
+mess_system:
+  base_url: "http://mes-internal.example.com"
+  api_token_env: "MES_API_TOKEN"
+  version_api: "/api/system/version"
+  deploy_api: "/api/system/deploy"
+  rollback_api: "/api/system/rollback"
+  health_api: "/api/health"
+  metrics_api: "/api/monitoring/metrics"
