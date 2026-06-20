@@ -309,6 +309,21 @@ class ReleaseScheduler:
         try:
             print(f"[{get_utc_now().isoformat()}] 📊 执行定时任务：生成周报...")
             report = reports_engine.generate_weekly_report(force=False)
+
+            missing_files = []
+            if report:
+                fps = report.file_paths or {}
+                for key in ("pdf", "xlsx"):
+                    if fps.get(key):
+                        if not Path(fps[key]).exists():
+                            missing_files.append(f"{key.upper()} ({fps[key]})")
+                    else:
+                        missing_files.append(key.upper())
+
+            if missing_files:
+                print(f"  ⚠️  检测到文件缺失: {', '.join(missing_files)}，强制重新生成...")
+                report = reports_engine.generate_weekly_report(force=True)
+
             if report:
                 fps = report.file_paths or {}
                 notifier.send(
@@ -333,6 +348,25 @@ class ReleaseScheduler:
                 except Exception:
                     pass
                 print(f"  ✅ 周报生成完成: {report.id}")
+                missing = []
+                if fps.get("pdf"):
+                    if not Path(fps["pdf"]).exists():
+                        missing.append(f"PDF ({fps['pdf']})")
+                else:
+                    missing.append("PDF")
+                if fps.get("xlsx"):
+                    if not Path(fps["xlsx"]).exists():
+                        missing.append(f"XLSX ({fps['xlsx']})")
+                else:
+                    missing.append("XLSX")
+                if missing:
+                    return {
+                        "success": False,
+                        "message": f"周报生成后缺失文件: {', '.join(missing)}",
+                        "report_id": report.id,
+                        "files": fps,
+                        "missing_files": missing,
+                    }
                 return {
                     "success": True,
                     "message": f"周报生成成功 (ID: {report.id})",
@@ -440,6 +474,10 @@ class ReleaseScheduler:
                         except Exception:
                             pass
                     print(f"  ✅ 演练完成: status={drill_refresh.status}, success={drill_refresh.success}")
+                    issues = drill_refresh.issues_found or []
+                    improvements = drill_refresh.improvement_actions or []
+                    if not improvements and issues:
+                        improvements = [f"针对问题 #{i+1} 制定整改方案并复测" for i in range(len(issues))]
                     return {
                         "success": bool(drill_refresh.success),
                         "message": f"演练{'成功' if drill_refresh.success else '失败'} (ID: {drill_refresh.id}, status: {drill_refresh.status})",
@@ -447,7 +485,8 @@ class ReleaseScheduler:
                         "drill_status": drill_refresh.status,
                         "drill_success": bool(drill_refresh.success),
                         "duration_seconds": drill_refresh.duration_seconds,
-                        "issues_found": drill_refresh.issues_found or [],
+                        "issues_found": issues,
+                        "improvement_actions": improvements,
                     }
             finally:
                 session.close()

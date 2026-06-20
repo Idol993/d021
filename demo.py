@@ -120,10 +120,23 @@ def scenario_3_manual_rollback():
             production_lines=["ORAL-03"],
         )
         ok = rb_result.get("success", False)
-        rb_id = rb_result.get("result", "")
+        real_rb_id = rb_result.get("rollback_id")
+        status_msg = rb_result.get("result", "")
+        steps = rb_result.get("steps") or []
+        report = rb_result.get("report") or {}
         status_icon = "✅" if ok else "❌"
-        id_display = f" | 回滚记录ID={rb_id}" if ok else f" | 错误={rb_id}"
-        print(f"   回滚结果: {status_icon} {'成功' if ok else '失败'}{id_display}")
+        print(f"   回滚结果: {status_icon} {'成功' if ok else '失败'}")
+        if real_rb_id:
+            print(f"   回滚记录ID: {real_rb_id}")
+        if not ok:
+            print(f"   错误原因: {status_msg}")
+            if report.get("error"):
+                print(f"   详细错误: {report['error']}")
+        if steps:
+            print(f"   执行步骤:")
+            for s in steps:
+                st_icon = {"ok": "✅", "degraded": "⚠️ ", "failed": "❌"}.get(s.get("status", "ok"), "❔")
+                print(f"      {st_icon} {s.get('step', '')}")
         return target
     finally:
         session.close()

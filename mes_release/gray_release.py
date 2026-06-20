@@ -569,19 +569,19 @@ class GrayReleaseEngine:
         operator: str,
         reason: str,
         production_lines: Optional[List[str]] = None,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Optional[str], Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
         session = get_session()
         try:
             release = session.query(ReleaseRequest).filter_by(id=release_id).first()
             if not release:
-                return False, "发布申请不存在"
+                return False, "发布申请不存在", None, None, None
 
             if release.status not in (
                 ReleaseStatus.GRAY_IN_PROGRESS,
                 ReleaseStatus.GRAY_COMPLETED,
                 ReleaseStatus.FULL_RELEASED,
             ):
-                return False, f"当前状态不允许手动回滚: {release.status.value}"
+                return False, f"当前状态不允许手动回滚: {release.status.value}", None, None, None
 
             if not production_lines:
                 lines = []
@@ -597,7 +597,29 @@ class GrayReleaseEngine:
                 triggered_by=operator,
                 force_rollback_type="manual",
             )
-            return True, rb_id
+
+            session2 = get_session()
+            try:
+                rb_fresh = session2.query(RollbackRecord).filter_by(id=rb_id).first()
+                if rb_fresh:
+                    steps = None
+                    deploy_error = None
+                    if rb_fresh.rollback_report:
+                        deploy_error = rb_fresh.rollback_report.get("error")
+                        steps = rb_fresh.rollback_report.get("steps")
+                    overall_success = bool(rb_fresh.success and rb_fresh.health_check_passed)
+                    status_msg = f"回滚{'成功' if overall_success else '失败'}"
+                    if not overall_success:
+                        reasons = []
+                        if not rb_fresh.success:
+                            reasons.append("回滚部署步骤失败")
+                        if not rb_fresh.health_check_passed:
+                            reasons.append("健康检查未通过")
+                        status_msg = "、".join(reasons)
+                    return overall_success, status_msg, rb_id, steps, (rb_fresh.rollback_report or {})
+            finally:
+                session2.close()
+            return bool(rb.success and rb.health_check_passed), "回滚执行完成", rb_id, None, (rb.rollback_report or {})
         finally:
             session.close()
 

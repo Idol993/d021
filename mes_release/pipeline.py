@@ -359,8 +359,17 @@ class ReleasePipeline:
         reason: str,
         production_lines: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        ok, result = gray_release_engine.manual_rollback(release_id, operator, reason, production_lines)
-        return {"success": ok, "result": result}
+        ok, result, rb_id, steps, rollback_report = gray_release_engine.manual_rollback(
+            release_id, operator, reason, production_lines
+        )
+        data: Dict[str, Any] = {"success": ok, "result": result}
+        if rb_id:
+            data["rollback_id"] = rb_id
+        if steps:
+            data["steps"] = steps
+        if rollback_report:
+            data["report"] = rollback_report
+        return data
 
     def audit_verify(self) -> Dict[str, Any]:
         return audit_logger.verify_chain()
@@ -487,7 +496,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sched_stop = sched_sub.add_parser("stop", help="停止调度器")
     sched_status = sched_sub.add_parser("status", help="查看调度器状态")
     sched_trigger = sched_sub.add_parser("trigger", help="立即触发执行指定任务")
-    sched_trigger.add_argument("--job", required=True, choices=["weekly_report_job", "rollback_drill_job"], help="任务ID")
+    sched_trigger.add_argument("job_pos", nargs="?", default=None,
+                               help="任务ID (位置参数: weekly_report_job 或 rollback_drill_job)")
+    sched_trigger.add_argument("--job", dest="job_opt", default=None,
+                               help="任务ID (可选参数: weekly_report_job 或 rollback_drill_job)")
 
     return parser
 
@@ -576,13 +588,38 @@ def main(argv: Optional[List[str]] = None):
     elif args.command == "rollback":
         result = release_pipeline.manual_rollback(args.release_id, args.operator, args.reason, args.line)
         ok = result.get("success", False)
-        rb_id = result.get("result", "")
+        status_msg = result.get("result", "")
+        rb_id = result.get("rollback_id")
+        steps = result.get("steps") or []
+        report = result.get("report") or {}
+
         if ok:
             print(f"✅ 人工回滚执行成功")
-            print(f"   回滚记录ID: {rb_id}")
+            if rb_id:
+                print(f"   回滚记录ID: {rb_id}")
+            if steps:
+                print(f"\n   📋 执行步骤:")
+                for s in steps:
+                    st_icon = {"ok": "✅", "degraded": "⚠️ ", "failed": "❌"}.get(s.get("status", "ok"), "❔")
+                    print(f"      {st_icon} {s.get('step', '')}")
+            sys.exit(0)
         else:
             print(f"❌ 人工回滚执行失败")
-            print(f"   错误原因: {rb_id}")
+            print(f"   错误原因: {status_msg}")
+            if rb_id:
+                print(f"   回滚记录ID (用于追踪): {rb_id}")
+            if steps:
+                print(f"\n   📋 执行步骤:")
+                for s in steps:
+                    st_icon = {"ok": "✅", "degraded": "⚠️ ", "failed": "❌"}.get(s.get("status", "ok"), "❔")
+                    icon_label = s.get("status", "")
+                    print(f"      {st_icon} [{icon_label:8}] {s.get('step', '')}")
+                    if s.get("status", "ok") != "ok":
+                        print(f"           → 失败步骤: {s.get('step', '')}")
+            if report.get("error"):
+                print(f"\n   🔴 详细错误: {report['error']}")
+            if rb_id:
+                print(f"\n   💡 请使用回滚记录ID {rb_id} 进行复盘调查")
             sys.exit(1)
 
     elif args.command == "drill":
@@ -710,8 +747,23 @@ def main(argv: Optional[List[str]] = None):
             elif not running:
                 print(f"无已注册任务")
         elif args.sched_command == "trigger":
-            print(f"⚡ 正在立即触发任务: {args.job} ...\n")
-            result = release_pipeline.scheduler_trigger(args.job)
+            VALID_JOBS = ["weekly_report_job", "rollback_drill_job"]
+            job_id = getattr(args, "job_opt", None) or getattr(args, "job_pos", None)
+
+            if not job_id:
+                print("❌ 缺少任务ID参数")
+                print(f"   用法1: scheduler trigger weekly_report_job")
+                print(f"   用法2: scheduler trigger --job weekly_report_job")
+                print(f"   可用任务: {', '.join(VALID_JOBS)}")
+                sys.exit(1)
+
+            if job_id not in VALID_JOBS:
+                print(f"❌ 无效的任务ID: {job_id}")
+                print(f"   可用任务: {', '.join(VALID_JOBS)}")
+                sys.exit(1)
+
+            print(f"⚡ 正在立即触发任务: {job_id} ...\n")
+            result = release_pipeline.scheduler_trigger(job_id)
             ok = result.get("success", False)
             msg = result.get("message", "")
             if ok:
@@ -719,19 +771,74 @@ def main(argv: Optional[List[str]] = None):
                 if result.get("report_id"):
                     print(f"   周报ID: {result['report_id']}")
                     fps = result.get("files", {})
+                    missing = []
                     if fps.get("pdf"):
-                        print(f"   📄 PDF:  {fps['pdf']}")
+                        pdf_path = Path(fps["pdf"])
+                        if pdf_path.exists():
+                            sz = pdf_path.stat().st_size
+                            print(f"   📄 PDF:  {fps['pdf']} ({sz} bytes)")
+                        else:
+                            missing.append(f"PDF ({fps['pdf']})")
+                    else:
+                        missing.append("PDF")
                     if fps.get("xlsx"):
-                        print(f"   📄 XLSX: {fps['xlsx']}")
+                        xlsx_path = Path(fps["xlsx"])
+                        if xlsx_path.exists():
+                            sz = xlsx_path.stat().st_size
+                            print(f"   📄 XLSX: {fps['xlsx']} ({sz} bytes)")
+                        else:
+                            missing.append(f"XLSX ({fps['xlsx']})")
+                    else:
+                        missing.append("XLSX")
+                    if missing:
+                        print(f"\n⚠️  以下文件未生成或路径不存在: {', '.join(missing)}")
+                        print(f"   请检查 reports_engine 配置")
+                        sys.exit(1)
                 if result.get("drill_id"):
                     print(f"   演练ID: {result['drill_id']}")
-                    print(f"   演练结果: {'✅ 成功' if result.get('drill_success') else '❌ 失败'}")
+                    drill_success = result.get("drill_success")
+                    if drill_success:
+                        print(f"   演练结果: ✅ 成功")
+                    else:
+                        print(f"   演练结果: ❌ 失败")
+                        print(f"   状态: {result.get('drill_status', 'unknown')}")
                     print(f"   耗时: {result.get('duration_seconds', 0):.1f}秒")
-                    issues = result.get("issues_found", [])
-                    if issues:
-                        print(f"   发现问题: {'; '.join(str(i) for i in issues)}")
+                    raw_issues = result.get("issues_found") or []
+                    issues = [i for i in raw_issues if i and str(i).strip() not in ("未发现严重问题", "无问题")]
+                    if drill_success and not issues:
+                        print(f"\n   🟢 未发现任何问题")
+                    else:
+                        if issues:
+                            print(f"\n   🔴 发现问题 ({len(issues)} 项):")
+                            for i, iss in enumerate(issues, 1):
+                                print(f"      {i}. {iss}")
+                    improvements = result.get("improvement_actions") or []
+                    if not improvements and issues:
+                        improvements = [f"针对问题 #{i+1} 制定整改方案并复测" for i in range(len(issues))]
+                    if improvements and not drill_success:
+                        print(f"\n   📝 改进建议 ({len(improvements)} 项):")
+                        for i, imp in enumerate(improvements, 1):
+                            print(f"      {i}. {imp}")
+                    if not drill_success:
+                        sys.exit(1)
             else:
                 print(f"\n❌ {msg}")
+                if result.get("drill_id"):
+                    print(f"   演练ID: {result['drill_id']}")
+                    print(f"   状态: {result.get('drill_status', 'unknown')}")
+                    raw_issues = result.get("issues_found") or []
+                    issues = [i for i in raw_issues if i and str(i).strip() not in ("未发现严重问题", "无问题")]
+                    if issues:
+                        print(f"\n   🔴 发现问题 ({len(issues)} 项):")
+                        for i, iss in enumerate(issues, 1):
+                            print(f"      {i}. {iss}")
+                    improvements = result.get("improvement_actions") or []
+                    if not improvements and issues:
+                        improvements = [f"针对问题 #{i+1} 制定整改方案并复测" for i in range(len(issues))]
+                    if improvements:
+                        print(f"\n   📝 改进建议 ({len(improvements)} 项):")
+                        for i, imp in enumerate(improvements, 1):
+                            print(f"      {i}. {imp}")
                 if result.get("error_detail"):
                     print(f"\n📋 详细错误堆栈:")
                     for ln in result["error_detail"].strip().split("\n"):
