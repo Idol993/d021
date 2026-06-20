@@ -247,6 +247,7 @@ class AuditLog(Base):
             "action": self.action,
             "category": self.category,
             "details": self.details,
+            "ip_address": self.ip_address,
             "entity_type": self.entity_type,
             "entity_id": self.entity_id,
             "previous_hash": self.previous_hash,

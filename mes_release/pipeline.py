@@ -1,6 +1,10 @@
 import argparse
 import json
+import os
+import signal
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -409,8 +413,8 @@ class ReleasePipeline:
             export_format=export_format,
         )
 
-    def scheduler_start(self) -> Dict[str, Any]:
-        return release_scheduler.start()
+    def scheduler_start(self, blocking: bool = False) -> Dict[str, Any]:
+        return release_scheduler.start(blocking=blocking)
 
     def scheduler_stop(self) -> Dict[str, Any]:
         return release_scheduler.stop()
@@ -476,13 +480,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     audit_p = sub.add_parser("audit-verify", help="审计日志完整性校验")
 
-    sched_p = sub.add_parser("scheduler", help="调度器管理")
+    sched_p = sub.add_parser("scheduler", help="调度器管理（周报+回滚演练）")
     sched_sub = sched_p.add_subparsers(dest="sched_command", required=True)
     sched_start = sched_sub.add_parser("start", help="启动调度器（每周一9点周报+每月28日14点演练）")
+    sched_start.add_argument("--daemon", action="store_true", help="后台模式启动（不阻塞，命令执行完即退出）")
     sched_stop = sched_sub.add_parser("stop", help="停止调度器")
     sched_status = sched_sub.add_parser("status", help="查看调度器状态")
-    sched_trigger = sched_sub.add_parser("trigger", help="立即触发指定任务")
-    sched_trigger.add_argument("--job", required=True, choices=["weekly_report_job", "rollback_drill_job"])
+    sched_trigger = sched_sub.add_parser("trigger", help="立即触发执行指定任务")
+    sched_trigger.add_argument("--job", required=True, choices=["weekly_report_job", "rollback_drill_job"], help="任务ID")
 
     return parser
 
@@ -570,7 +575,15 @@ def main(argv: Optional[List[str]] = None):
 
     elif args.command == "rollback":
         result = release_pipeline.manual_rollback(args.release_id, args.operator, args.reason, args.line)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        ok = result.get("success", False)
+        rb_id = result.get("result", "")
+        if ok:
+            print(f"✅ 人工回滚执行成功")
+            print(f"   回滚记录ID: {rb_id}")
+        else:
+            print(f"❌ 人工回滚执行失败")
+            print(f"   错误原因: {rb_id}")
+            sys.exit(1)
 
     elif args.command == "drill":
         result = release_pipeline.run_rollback_drill(args.title or None, args.scenario or None)
@@ -604,28 +617,126 @@ def main(argv: Optional[List[str]] = None):
         print(f"校验结果: {'✅ 通过' if result['verified'] else '❌ 存在问题'}")
         if result["issues"]:
             for issue in result["issues"]:
-                print(f"   ⚠️  [{issue['index']}] {issue['type']}: {issue.get('log_id')}")
+                print(f"   ⚠️  [{issue['index']}] {issue['type']}: {issue.get('log_id', '')}")
+                detail = issue.get("detail")
+                if detail:
+                    print(f"        {detail}")
+                tampered = issue.get("tampered_fields") or []
+                if tampered:
+                    print(f"        🔍 疑似篡改字段: {', '.join(tampered)}")
 
     elif args.command == "scheduler":
         if args.sched_command == "start":
-            result = release_pipeline.scheduler_start()
-            print(f"{'✅' if result['running'] else '❌'} {result['message']}")
+            blocking = not getattr(args, "daemon", False)
+            result = release_pipeline.scheduler_start(blocking=blocking)
             if result.get("already_running"):
-                print("   (重复启动已拦截，未创建重复任务)")
-            for jid, jinfo in (result.get("jobs") or {}).items():
-                print(f"   🕒 {jinfo['name']}: {jinfo['cron']} | 下次: {jinfo.get('next_run', '-')}")
+                ext_pid = result.get("external_pid")
+                pid_info = f"（PID={ext_pid}）" if ext_pid else "（当前进程）"
+                print(f"⏹  调度器已在运行中{pid_info}，未重复启动")
+                print(f"   💡 提示: 如需重新启动，请先执行 `scheduler stop`")
+            else:
+                print(f"✅ {result['message']}")
+            print(f"   状态: 运行中 🟢  (PID={result.get('pid', os.getpid())})")
+            if result.get("jobs"):
+                print(f"   已注册任务数: {len(result['jobs'])}")
+                for jid, jinfo in result["jobs"].items():
+                    next_run = jinfo.get("next_run", "-")
+                    if next_run:
+                        try:
+                            from datetime import datetime as dt
+                            nr = dt.fromisoformat(next_run)
+                            next_run = nr.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    print(f"   🕒 [{jid}] {jinfo['name']}")
+                    print(f"      计划: cron[{jinfo.get('cron','')}]")
+                    print(f"      下次触发: {next_run}")
+            if blocking and result.get("running") and not result.get("already_running"):
+                try:
+                    print(f"\n💤 调度器常驻运行中，按 Ctrl+C 停止...")
+                    stop_event = threading.Event()
+
+                    def _sigint(signum, frame):
+                        stop_event.set()
+
+                    signal.signal(signal.SIGINT, _sigint)
+                    if hasattr(signal, "SIGTERM"):
+                        signal.signal(signal.SIGTERM, _sigint)
+                    while not stop_event.is_set():
+                        time.sleep(1)
+                except (KeyboardInterrupt, SystemExit):
+                    pass
+                finally:
+                    from mes_release.scheduler import _remove_state
+                    _remove_state()
+                    if release_scheduler._scheduler and release_scheduler._scheduler.running:
+                        release_scheduler._scheduler.shutdown(wait=False)
+                        release_scheduler._scheduler = None
+                    print(f"\n🛑 调度器已停止")
         elif args.sched_command == "stop":
             result = release_pipeline.scheduler_stop()
-            print(f"{'✅' if not result['running'] else '❌'} {result['message']}")
+            if result.get("already_stopped"):
+                print(f"⏹  {result['message']}")
+            else:
+                print(f"✅ {result['message']}")
+                if result.get("jobs"):
+                    print(f"   已停止任务数: {len(result['jobs'])}")
         elif args.sched_command == "status":
             result = release_pipeline.scheduler_status()
-            print(f"调度器状态: {'✅ 运行中' if result['running'] else '⏹  已停止'}")
-            if result.get("jobs"):
-                for jid, jinfo in result["jobs"].items():
-                    print(f"   🕒 {jinfo['name']}: {jinfo['cron']} | 下次: {jinfo.get('next_run', '-')}")
+            running = result.get("running", False)
+            pid = result.get("pid")
+            if running:
+                pid_display = f"  (PID={pid})" if pid else ""
+                print(f"调度器状态: 🟢 运行中{pid_display}")
+            else:
+                print(f"调度器状态: 🔴 已停止")
+            jobs = result.get("jobs") or {}
+            if running and jobs:
+                print(f"已注册任务数: {len(jobs)}")
+                for jid, jinfo in jobs.items():
+                    next_run = jinfo.get("next_run", "-")
+                    if next_run:
+                        try:
+                            from datetime import datetime as dt
+                            nr = dt.fromisoformat(next_run)
+                            next_run = nr.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    print(f"\n  🕒 任务ID: {jid}")
+                    print(f"     名称:     {jinfo['name']}")
+                    print(f"     Cron:     {jinfo.get('cron','')}")
+                    print(f"     下次触发: {next_run}")
+                    print(f"     容错期:   {jinfo.get('misfire_grace_time', 0)}秒")
+            elif not running:
+                print(f"无已注册任务")
         elif args.sched_command == "trigger":
+            print(f"⚡ 正在立即触发任务: {args.job} ...\n")
             result = release_pipeline.scheduler_trigger(args.job)
-            print(f"{'✅' if result['success'] else '❌'} {result['message']}")
+            ok = result.get("success", False)
+            msg = result.get("message", "")
+            if ok:
+                print(f"\n✅ {msg}")
+                if result.get("report_id"):
+                    print(f"   周报ID: {result['report_id']}")
+                    fps = result.get("files", {})
+                    if fps.get("pdf"):
+                        print(f"   📄 PDF:  {fps['pdf']}")
+                    if fps.get("xlsx"):
+                        print(f"   📄 XLSX: {fps['xlsx']}")
+                if result.get("drill_id"):
+                    print(f"   演练ID: {result['drill_id']}")
+                    print(f"   演练结果: {'✅ 成功' if result.get('drill_success') else '❌ 失败'}")
+                    print(f"   耗时: {result.get('duration_seconds', 0):.1f}秒")
+                    issues = result.get("issues_found", [])
+                    if issues:
+                        print(f"   发现问题: {'; '.join(str(i) for i in issues)}")
+            else:
+                print(f"\n❌ {msg}")
+                if result.get("error_detail"):
+                    print(f"\n📋 详细错误堆栈:")
+                    for ln in result["error_detail"].strip().split("\n"):
+                        print(f"   {ln}")
+                sys.exit(1)
 
     else:
         parser.print_help()
